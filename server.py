@@ -1,449 +1,271 @@
-"""
-BaseYield Oracle — Real-Time DeFi Lending & Staking Yield Oracle for Base Mainnet.
+"""DefiLlama yield aggregation for Base, paid through x402 v2."""
 
-Aggregates real-time lending rates, staking APYs, and liquidity pool yields across
-Aave v3, Morpho Blue, Moonwell, Aerodrome, and Compound on Base (Chain ID 8453).
-Payable via x402 micro-payments ($0.01 USDC on Base).
-"""
-
-import base64
 from datetime import datetime, timezone
-import json
-import os
-from typing import Any, Dict, List, Optional
+import logging
+import math
+import re
+from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-# Constants & Configuration
-PAYEE_ADDRESS = os.getenv("PAYEE_ADDRESS", "0xb5aFc89b57Fa8270bB7261348179D28099BEa2a0")
+from x402_payment import PaidOperation, PaymentGate, configured_payee
+
+PAYEE_ADDRESS = configured_payee()
 PRICE_USDC = 0.01
-PRICE_ATOMIC = "10000"  # 0.01 USDC (6 decimals = 10,000 atomic units)
+PRICE_ATOMIC = "10000"
 CHAIN_ID = "eip155:8453"
 USDC_ASSET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-
-app = FastAPI(
-    title="BaseYield Oracle x402",
-    description="Real-Time DeFi Lending and Staking Yield Oracle for Base Mainnet, payable via x402.",
-    version="1.0.0",
-    redirect_slashes=False,
-    contact={
-        "name": "BaseYield Oracle",
-        "email": "ivansky.dev@gmail.com",
-        "url": "https://github.com/Ivansky1/baseyield-x402",
-    },
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+YIELDS_URL = "https://yields.llama.fi/pools"
+logger = logging.getLogger("baseyield")
 
 
-def make_x402_challenge(resource_url: str, description: str = "BaseYield Oracle API Access") -> Dict[str, Any]:
-    """Generate canonical x402 v2 challenge payload passing 100% of discovery checks."""
-    return {
-        "x402Version": 2,
-        "version": 2,
-        "resource": {
-            "url": resource_url,
-            "description": f"{description} (${PRICE_USDC:.2f} USDC)",
-            "mimeType": "application/json",
-        },
-        "accepts": [
-            {
-                "scheme": "exact",
-                "network": CHAIN_ID,
-                "asset": USDC_ASSET,
-                "amount": PRICE_ATOMIC,
-                "maxAmountRequired": PRICE_ATOMIC,
-                "payee": PAYEE_ADDRESS,
-                "payTo": PAYEE_ADDRESS,
-                "maxTimeoutSeconds": 300,
-                "description": f"{description} (${PRICE_USDC:.2f} USDC)",
-                "extra": {
-                    "name": "USD Coin",
-                    "version": "2",
-                    "assetTransferMethod": "eip3009",
-                },
-            }
-        ],
-        "extensions": {
-            "bazaar": {
-                "info": {
-                    "name": "BaseYield DeFi Oracle",
-                    "description": "Real-time lending APY, pool yields, and TVL metrics across Base protocols.",
-                    "input": {
-                        "type": "object",
-                        "properties": {
-                            "asset": {
-                                "type": "string",
-                                "description": "Asset symbol (e.g. USDC, WETH, ETH, CBBTC)",
-                                "default": "USDC",
-                            },
-                            "min_tvl": {
-                                "type": "number",
-                                "description": "Minimum TVL in USD to filter (default: 500000)",
-                                "default": 500000,
-                            },
-                        },
-                    },
-                    "output": {
-                        "type": "object",
-                        "properties": {
-                            "network": {"type": "string"},
-                            "asset": {"type": "string"},
-                            "best_apy": {"type": "number"},
-                            "pools": {"type": "array"},
-                            "timestamp": {"type": "string"},
-                        },
-                    },
-                },
-                "schema": {
-                    "properties": {
-                        "input": {
-                            "properties": {
-                                "queryParams": {
-                                    "type": "object",
-                                    "properties": {
-                                        "asset": {"type": "string", "default": "USDC"},
-                                        "min_tvl": {"type": "number", "default": 500000},
-                                    },
-                                },
-                                "body": {
-                                    "type": "object",
-                                    "properties": {
-                                        "asset": {"type": "string", "default": "USDC"},
-                                        "min_tvl": {"type": "number", "default": 500000},
-                                    },
-                                },
-                            }
-                        },
-                        "output": {
-                            "properties": {
-                                "example": {
-                                    "type": "object",
-                                    "properties": {
-                                        "network": {"type": "string"},
-                                        "asset": {"type": "string"},
-                                        "best_apy": {"type": "number"},
-                                        "protocol": {"type": "string"},
-                                        "timestamp": {"type": "string"},
-                                    },
-                                }
-                            }
-                        },
-                    }
-                },
-            }
-        },
-    }
+class YieldInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    asset: str = Field("USDC", min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._-]+$")
+    min_tvl: float = Field(100000, ge=0, le=1e15)
 
 
-def build_402_response(resource_url: str, description: str = "BaseYield Oracle API Access") -> JSONResponse:
-    challenge = make_x402_challenge(resource_url, description)
-    challenge_b64 = base64.b64encode(json.dumps(challenge).encode("utf-8")).decode("utf-8")
-    return JSONResponse(
-        status_code=402,
-        content=challenge,
-        headers={
-            "Payment-Required": challenge_b64,
-            "Access-Control-Expose-Headers": "Payment-Required",
-        },
-    )
+class TopPoolsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    min_tvl: float = Field(1000000, ge=0, le=1e15)
+    limit: int = Field(10, ge=1, le=100)
 
 
-async def fetch_base_pools() -> List[Dict[str, Any]]:
-    """Query live DefiLlama yield pool data for Base Mainnet."""
-    url = "https://yields.llama.fi/pools"
+class Pool(BaseModel):
+    project: str
+    symbol: str
+    pool_id: str
+    apy: Optional[float]
+    apy_base: Optional[float]
+    apy_reward: Optional[float]
+    tvl_usd: float
+    underlying_tokens: list[str]
+    source_timestamp: Optional[str]
+
+
+class Provenance(BaseModel):
+    success: bool
+    network: str
+    source: str
+    source_timestamp: Optional[str]
+    fetched_at: str
+    timestamp: str
+
+
+class YieldResponse(Provenance):
+    asset: str
+    matched_pools_count: int
+    best_apy: Optional[float]
+    best_protocol: Optional[str]
+    pools: list[Pool]
+
+
+class TopPoolsResponse(Provenance):
+    total_qualifying_pools: int
+    top_pools: list[Pool]
+
+
+def response_schema(model):
+    """Inline local model refs so this schema also works inside Bazaar metadata."""
+    schema = model.model_json_schema()
+    definitions = schema.get("$defs", {})
+
+    def inline(value):
+        if isinstance(value, dict):
+            if "$ref" in value:
+                return inline(definitions[value["$ref"].rsplit("/", 1)[-1]])
+            return {key: inline(item) for key, item in value.items() if key != "$defs"}
+        return [inline(item) for item in value] if isinstance(value, list) else value
+
+    return inline(schema)
+
+
+app = FastAPI(title="BaseYield Oracle x402", version="1.1.0", redirect_slashes=False,
+              description="Filters and ranks DefiLlama yield snapshots for Base pools.")
+payment = PaymentGate(service="BaseYield", payee=PAYEE_ADDRESS, amount=PRICE_ATOMIC, operations=[
+    PaidOperation(method="GET", path="/v1/yields",
+                  description="Returns DefiLlama Base yield pools matching an asset symbol, ranked by reported APY.",
+                  input_schema=YieldInput.model_json_schema(),
+                  output_schema=response_schema(YieldResponse),
+                  example={"asset": "USDC", "min_tvl": 100000}),
+    PaidOperation(method="GET", path="/v1/top-pools",
+                  description="Returns DefiLlama Base pools with positive reported APY, ranked by TVL.",
+                  input_schema=TopPoolsInput.model_json_schema(),
+                  output_schema=response_schema(TopPoolsResponse),
+                  example={"min_tvl": 1000000, "limit": 10}),
+])
+
+
+class UpstreamUnavailable(Exception):
+    """The upstream did not provide a complete usable dataset."""
+
+
+def upstream_error():
+    return JSONResponse(status_code=502, content={"success": False, "error": {
+        "code": "upstream_unavailable", "message": "DefiLlama yield data is unavailable."}})
+
+
+def _number(value, *, optional=False):
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise UpstreamUnavailable()
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url, headers={"User-Agent": "BaseYield-Oracle/1.0"})
-            if resp.status_code == 200:
-                data = resp.json()
-                return [p for p in data.get("data", []) if p.get("chain") == "Base"]
-    except Exception:
-        pass
-    return []
+        if not math.isfinite(value):
+            raise UpstreamUnavailable()
+    except OverflowError as exc:
+        raise UpstreamUnavailable() from exc
+    return round(float(value), 2)
 
 
-# Public Endpoints
-@app.get("/", summary="API Index & Service Info")
+def _source_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and len(value) <= 100:
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return str(value)
+    raise UpstreamUnavailable()
+
+
+def normalize_pool(pool):
+    for field in ("project", "symbol", "pool"):
+        if not isinstance(pool.get(field), str) or not pool[field]:
+            raise UpstreamUnavailable()
+    tokens = pool.get("underlyingTokens")
+    if tokens is None:
+        tokens = []
+    if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
+        raise UpstreamUnavailable()
+    tvl = _number(pool.get("tvlUsd"))
+    if tvl < 0:
+        raise UpstreamUnavailable()
+    return {"project": pool["project"], "symbol": pool["symbol"], "pool_id": pool["pool"],
+            "apy": _number(pool.get("apy"), optional=True),
+            "apy_base": _number(pool.get("apyBase"), optional=True),
+            "apy_reward": _number(pool.get("apyReward"), optional=True),
+            "tvl_usd": tvl, "underlying_tokens": tokens,
+            "source_timestamp": _source_timestamp(pool.get("timestamp"))}
+
+
+async def fetch_base_pools() -> dict:
+    """Fetch a real upstream snapshot; a failed fetch is never an empty dataset."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+            response = await client.get(YIELDS_URL, headers={"User-Agent": "BaseYield-Oracle/1.1"})
+        response.raise_for_status()
+        payload = response.json()
+        if (not isinstance(payload, dict) or not isinstance(payload.get("data"), list)
+            or payload.get("status", "success") != "success"):
+            raise UpstreamUnavailable()
+        pools = []
+        for pool in payload["data"]:
+            if not isinstance(pool, dict) or not isinstance(pool.get("chain"), str):
+                raise UpstreamUnavailable()
+            if pool["chain"] == "Base":
+                # Validate now so malformed Base rows cannot masquerade as zero matches.
+                normalize_pool(pool)
+                pools.append(pool)
+        return {"pools": pools, "source": "DefiLlama",
+                "source_timestamp": _source_timestamp(payload.get("timestamp")),
+                "fetched_at": datetime.now(timezone.utc).isoformat()}
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, UpstreamUnavailable) as exc:
+        logger.warning("upstream_request_failed", extra={"service": "BaseYield", "upstream": "DefiLlama"})
+        raise UpstreamUnavailable() from exc
+
+
+def provenance(snapshot):
+    return {"success": True, "network": "Base Mainnet (8453)", "source": snapshot["source"],
+            "source_timestamp": snapshot["source_timestamp"], "fetched_at": snapshot["fetched_at"],
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/", summary="API index")
 async def root():
-    return {
-        "service": "BaseYield Oracle",
-        "version": "1.0.0",
-        "network": "Base Mainnet (8453)",
-        "docs": "/docs",
-        "openapi": "/openapi.json",
-        "manifest": "/.well-known/x402",
-        "endpoints": {
-            "yields": "/v1/yields",
-            "top_pools": "/v1/top-pools",
-        },
-        "price_usd": f"${PRICE_USDC:.2f}",
-        "payee": PAYEE_ADDRESS,
-        "status": "online",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"service": "BaseYield Oracle", "version": "1.1.0", "network": "Base Mainnet (8453)",
+            "docs": "/docs", "openapi": "/openapi.json", "manifest": "/.well-known/x402",
+            "endpoints": {"yields": "/v1/yields", "top_pools": "/v1/top-pools"},
+            "price_usd": "$0.01", "payee": PAYEE_ADDRESS, "status": "online", "source": "DefiLlama"}
 
 
-@app.get("/health", summary="Health Check")
+@app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "chain_id": 8453,
-        "payee": PAYEE_ADDRESS,
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"status": "healthy", "chain_id": 8453, "payee": PAYEE_ADDRESS}
 
 
-@app.get("/.well-known/x402", summary="x402 Discovery Manifest")
-async def x402_manifest(request: Request):
-    base_url = str(request.base_url).rstrip("/")
-    return {
-        "version": 1,
-        "name": "BaseYield Oracle",
-        "description": "Real-Time DeFi Lending & Staking Yield Oracle for Base Mainnet.",
-        "network": CHAIN_ID,
-        "price": f"${PRICE_USDC:.2f}",
-        "currency": "USDC",
-        "payee": PAYEE_ADDRESS,
-        "ownershipProofs": [PAYEE_ADDRESS],
-        "resources": [
-            {
-                "type": "http",
-                "method": "GET",
-                "url": f"{base_url}/v1/yields",
-                "description": "Compare lending APY and pool yields for a specific asset on Base.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-            {
-                "type": "http",
-                "method": "POST",
-                "url": f"{base_url}/v1/yields",
-                "description": "Compare lending APY and pool yields for a specific asset on Base.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-            {
-                "type": "http",
-                "method": "GET",
-                "url": f"{base_url}/v1/top-pools",
-                "description": "Fetch top verified DeFi yield pools on Base sorted by TVL and APY.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-            {
-                "type": "http",
-                "method": "POST",
-                "url": f"{base_url}/v1/top-pools",
-                "description": "Fetch top verified DeFi yield pools on Base sorted by TVL and APY.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-        ],
-    }
+@app.get("/.well-known/x402")
+async def manifest(request: Request):
+    return payment.manifest(request)
 
 
-# Paid Endpoint: /v1/yields
-@app.api_route("/v1/yields", methods=["GET", "POST", "HEAD"], summary="Compare Asset Yields on Base (x402 Paid)")
-async def get_yields(
-    request: Request,
-    asset: Optional[str] = "USDC",
-    min_tvl: Optional[float] = 100000.0,
-    x_payment_response: Optional[str] = Header(None, alias="x-payment-response"),
-    payment_response: Optional[str] = Header(None, alias="payment-response"),
-):
-    if request.method == "HEAD":
-        return build_402_response(str(request.url), "BaseYield Asset Comparison")
-
-    if request.method == "POST":
-        try:
-            body = await request.json()
-            asset = body.get("asset", asset)
-            min_tvl = float(body.get("min_tvl", min_tvl))
-        except Exception:
-            pass
-
-    has_payment = bool(x_payment_response or payment_response)
-    if not has_payment:
-        return build_402_response(str(request.url), f"BaseYield Asset Comparison ({asset})")
-
-    clean_asset = asset.strip().upper()
-    all_pools = await fetch_base_pools()
-
-    # Filter by symbol matching asset and TVL
-    matched = []
-    for p in all_pools:
-        sym = (p.get("symbol") or "").upper()
-        tvl = float(p.get("tvlUsd") or 0.0)
-        if clean_asset in sym and tvl >= min_tvl:
-            matched.append({
-                "project": p.get("project"),
-                "symbol": p.get("symbol"),
-                "pool_id": p.get("pool"),
-                "apy": round(float(p.get("apy") or 0.0), 2),
-                "apy_base": round(float(p.get("apyBase") or 0.0), 2),
-                "apy_reward": round(float(p.get("apyReward") or 0.0), 2),
-                "tvl_usd": round(tvl, 2),
-                "underlying_tokens": p.get("underlyingTokens", []),
-            })
-
-    # Sort by APY descending
-    matched.sort(key=lambda x: x["apy"], reverse=True)
-    best_pool = matched[0] if matched else None
-
-    return {
-        "success": True,
-        "network": "Base Mainnet (8453)",
-        "asset": clean_asset,
-        "matched_pools_count": len(matched),
-        "best_apy": best_pool["apy"] if best_pool else 0.0,
-        "best_protocol": best_pool["project"] if best_pool else None,
-        "pools": matched[:15],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+async def yield_data(inputs: YieldInput):
+    try:
+        snapshot = await fetch_base_pools()
+        clean_asset = inputs.asset.upper()
+        matched = []
+        for raw in snapshot["pools"]:
+            # Match symbol components, so ETH does not silently include WETH/stETH.
+            if clean_asset not in re.split(r"[-/+]", raw["symbol"].upper()):
+                continue
+            pool = normalize_pool(raw)
+            if pool["tvl_usd"] >= inputs.min_tvl:
+                matched.append(pool)
+        matched.sort(key=lambda pool: (pool["apy"] is not None, pool["apy"] or 0), reverse=True)
+        best = next((pool for pool in matched if pool["apy"] is not None), None)
+        return {**provenance(snapshot), "asset": clean_asset, "matched_pools_count": len(matched),
+                "best_apy": best["apy"] if best else None, "best_protocol": best["project"] if best else None,
+                "pools": matched[:15]}
+    except UpstreamUnavailable:
+        return upstream_error()
 
 
-# Paid Endpoint: /v1/top-pools
-@app.api_route("/v1/top-pools", methods=["GET", "POST", "HEAD"], summary="Top DeFi Pools on Base (x402 Paid)")
-async def top_pools(
-    request: Request,
-    min_tvl: Optional[float] = 1000000.0,
-    limit: Optional[int] = 10,
-    x_payment_response: Optional[str] = Header(None, alias="x-payment-response"),
-    payment_response: Optional[str] = Header(None, alias="payment-response"),
-):
-    if request.method == "HEAD":
-        return build_402_response(str(request.url), "BaseYield Top Pools")
-
-    if request.method == "POST":
-        try:
-            body = await request.json()
-            min_tvl = float(body.get("min_tvl", min_tvl))
-            limit = int(body.get("limit", limit))
-        except Exception:
-            pass
-
-    has_payment = bool(x_payment_response or payment_response)
-    if not has_payment:
-        return build_402_response(str(request.url), f"BaseYield Top Pools (TVL >= ${min_tvl:,.0f})")
-
-    all_pools = await fetch_base_pools()
-    filtered = []
-    for p in all_pools:
-        tvl = float(p.get("tvlUsd") or 0.0)
-        apy = float(p.get("apy") or 0.0)
-        if tvl >= min_tvl and apy > 0.0:
-            filtered.append({
-                "project": p.get("project"),
-                "symbol": p.get("symbol"),
-                "pool_id": p.get("pool"),
-                "apy": round(apy, 2),
-                "tvl_usd": round(tvl, 2),
-            })
-
-    # Sort by TVL descending
-    filtered.sort(key=lambda x: x["tvl_usd"], reverse=True)
-
-    return {
-        "success": True,
-        "network": "Base Mainnet (8453)",
-        "total_qualifying_pools": len(filtered),
-        "top_pools": filtered[:limit],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+@app.get("/v1/yields", response_model=YieldResponse)
+async def get_yields(asset: str = Query("USDC", min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._-]+$"),
+                     min_tvl: float = Query(100000, ge=0, le=1e15, allow_inf_nan=False)):
+    return await yield_data(YieldInput(asset=asset, min_tvl=min_tvl))
 
 
-# Self-test endpoint
-@app.get("/self-test", summary="Test yield data connectivity")
+@app.post("/v1/yields", include_in_schema=False)
+async def post_yields(inputs: YieldInput):
+    return await yield_data(inputs)
+
+
+async def top_pools_data(inputs: TopPoolsInput):
+    try:
+        snapshot = await fetch_base_pools()
+        filtered = []
+        for raw in snapshot["pools"]:
+            pool = normalize_pool(raw)
+            if pool["tvl_usd"] >= inputs.min_tvl and pool["apy"] is not None and pool["apy"] > 0:
+                filtered.append(pool)
+        filtered.sort(key=lambda pool: pool["tvl_usd"], reverse=True)
+        return {**provenance(snapshot), "total_qualifying_pools": len(filtered), "top_pools": filtered[:inputs.limit]}
+    except UpstreamUnavailable:
+        return upstream_error()
+
+
+@app.get("/v1/top-pools", response_model=TopPoolsResponse)
+async def top_pools(min_tvl: float = Query(1000000, ge=0, le=1e15, allow_inf_nan=False),
+                    limit: int = Query(10, ge=1, le=100)):
+    return await top_pools_data(TopPoolsInput(min_tvl=min_tvl, limit=limit))
+
+
+@app.post("/v1/top-pools", include_in_schema=False)
+async def post_top_pools(inputs: TopPoolsInput):
+    return await top_pools_data(inputs)
+
+
+@app.get("/self-test", summary="Configuration diagnostics; no live data request")
 async def self_test():
-    pools = await fetch_base_pools()
-    return {
-        "status": "ok",
-        "base_pools_detected": len(pools),
-        "payee_configured": PAYEE_ADDRESS,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"status": "configuration_only", "payee_configured": PAYEE_ADDRESS,
+            "live_upstream_tested": False, "source": "DefiLlama"}
 
 
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="BaseYield Oracle x402",
-        version="1.0.0",
-        description="Real-Time DeFi Lending & Staking Yield Oracle for Base Mainnet (Chain ID 8453), payable via x402.",
-        routes=app.routes,
-    )
-    openapi_schema["x-payment-info"] = {
-        "protocols": [
-            {
-                "x402": {
-                    "version": 2,
-                    "network": CHAIN_ID,
-                    "asset": USDC_ASSET,
-                    "payee": PAYEE_ADDRESS,
-                    "price_usd": PRICE_USDC,
-                }
-            }
-        ]
-    }
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-
-app.openapi = custom_openapi
+payment.install(app)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8004, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=8004)
