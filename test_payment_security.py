@@ -47,6 +47,17 @@ def payload_for(client, op, *, method=None, path=None):
 
 def business_fixture():
     service = server.payment.service.lower()
+    if "nft" in service:
+        return "fetch_nft_data", {"success": True, "source": "mock_nft", "collection": "Basenames",
+            "contract_address": PAYER, "tokens_held": 1, "is_holder": True,
+            "floor_price_eth": None, "floor_price_usd": None}
+    if "audit" in service:
+        return "analyze_contract", {"address": PAYER, "is_contract": True, "is_proxy": False,
+            "proxy_type": None, "implementation_address": None, "admin_address": None,
+            "beacon_address": None, "analysis_type": "static_onchain_heuristic",
+            "analysis_scope": "queried_address_runtime_only", "confidence": "limited",
+            "risk_level": "NOT_ASSESSED", "security_findings": [], "limitations": [],
+            "data_sources": [], "timestamp": "2026-09-16T00:00:00+00:00"}
     if "gas" in service:
         return "fetch_base_fee_history", {"oldestBlock": "0x64", "baseFeePerGas": ["0x100"] * 6,
                 "reward": [["0x1", "0x2", "0x3", "0x4"]] * 5, "gasUsedRatio": [0.5] * 5}
@@ -275,8 +286,9 @@ def test_successful_nonce_cannot_be_reused(boundary):
     assert request(client, OPS[0], headers=headers).status_code == 200
     count = business.await_count
     result = request(client, OPS[0], headers=headers)
-    assert result.status_code == 402
+    assert result.status_code == 409
     assert result.json()["error"]["code"] == "payment_replayed"
+    assert "PAYMENT-REQUIRED" not in result.headers
     assert business.await_count == count
     assert len(calls) == 2
 
@@ -438,7 +450,7 @@ def test_concurrent_nonce_replay_does_not_execute_twice(boundary):
                 await asyncio.wait_for(entered.wait(), timeout=2)
                 try:
                     second = await request(ac, OPS[0], headers=headers)
-                    assert second.status_code == 402
+                    assert second.status_code == 409
                     assert second.json()["error"]["code"] == "payment_replayed"
                     business.assert_not_awaited()
                 finally:
@@ -447,3 +459,53 @@ def test_concurrent_nonce_replay_does_not_execute_twice(boundary):
         assert [c[0] for c in calls] == ["verify", "settle"]
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("outcome", ["pending", "timeout", "malformed", "wrong_network"])
+def test_uncertain_settlement_and_retry_never_request_a_new_payment(boundary, outcome):
+    client, business, calls, _, state = boundary
+    if outcome == "pending":
+        state["settle"] = {"success": False, "errorReason": "settlement_pending",
+                           "network": NETWORK, "transaction": TX, "payer": PAYER}
+    elif outcome == "timeout":
+        state["settle"] = httpx.ReadTimeout("private-transport-details")
+    elif outcome == "malformed":
+        state["settle"] = httpx.Response(200, content=b"malformed-settlement")
+    else:
+        state["settle"] = {"success": True, "network": "eip155:84532", "transaction": TX}
+    headers = {"PAYMENT-SIGNATURE": encode_header(payload_for(client, OPS[0]))}
+    first = request(client, OPS[0], headers=headers)
+    assert first.status_code == 503
+    error = first.json()["error"]
+    assert error["code"] == ("payment_settlement_pending" if outcome == "pending" else "payment_settlement_unknown")
+    assert error["retry_new_payment"] is False
+    assert error["action"] == "reconcile_before_new_payment"
+    assert error["network"] == NETWORK
+    if outcome == "pending":
+        assert error["transaction"] == TX
+    else:
+        assert "transaction" not in error
+    executed = business.await_count
+    assert executed > 0
+    second = request(client, OPS[0], headers=headers)
+    assert second.status_code == 503
+    assert second.json() == first.json()
+    assert business.await_count == executed
+    assert [c[0] for c in calls] == ["verify", "settle"]
+    for response in (first, second):
+        assert "PAYMENT-REQUIRED" not in response.headers
+        assert "PAYMENT-RESPONSE" not in response.headers
+        assert "private" not in response.text
+
+
+@pytest.mark.parametrize("transaction", ["", "invalid", "0x12"])
+def test_pending_receipt_requires_valid_transaction_hash(boundary, transaction):
+    client, _, calls, _, state = boundary
+    state["settle"] = {"success": False, "errorReason": "settlement_pending", "network": NETWORK,
+                       "transaction": transaction}
+    result = request(client, OPS[0], headers={"PAYMENT-SIGNATURE": encode_header(payload_for(client, OPS[0]))})
+    assert result.status_code == 503
+    assert result.json()["error"]["code"] == "payment_settlement_unknown"
+    assert "transaction" not in result.json()["error"]
+    assert "PAYMENT-REQUIRED" not in result.headers
+    assert [c[0] for c in calls] == ["verify", "settle"]

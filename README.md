@@ -103,3 +103,32 @@ CI runs the entire pytest suite on Python 3.12, including
 `test_fake_header_does_not_unlock_resource`, on pushes and pull requests. This
 workflow must be enabled and configured as a required check in repository hosting
 to block merges; merely adding the workflow does not change branch protections.
+
+## Locked installation and settlement recovery
+
+`requirements.lock` pins the complete runtime and test dependency closure with
+official PyPI artifact SHA256 hashes. A separate clean CPython 3.12.10 environment
+was installed and tested with the released x402 2.23.0 wheel for this repository;
+no SDK source checkout or PYTHONPATH override is required. Install with:
+
+```bash
+python -m pip install --require-hashes -r requirements.lock -r requirements-dev.txt
+python -m pytest -q
+```
+
+CI uses the same hashed installation and the `payment-security` job. Requiring
+that job before merging is a separate repository branch-protection setting.
+
+If settlement returns `settlement_pending` with a validated transaction hash,
+the service returns HTTP 503 `payment_settlement_pending` with that hash. A
+transport failure or ambiguous receipt returns `payment_settlement_unknown`.
+Both omit PAYMENT-REQUIRED/PAYMENT-RESPONSE and set `retry_new_payment: false`:
+reconcile the existing authorization before paying again. The process-local
+guard retains that outcome for the authorization lifetime; a duplicate does not
+rerun business work or settlement. Successfully used/in-flight authorizations
+return 409 on local reuse, without requesting a new payment.
+
+There is no automatic settlement retry, durable cross-replica reconciliation,
+or refund mechanism. On-chain nonce consumption alone is not proof of a transfer
+(an authorization can be canceled); recovery must verify the matching successful
+chain receipt and transfer/authorization events with the trusted provider.

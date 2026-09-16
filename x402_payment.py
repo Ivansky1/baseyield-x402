@@ -112,9 +112,28 @@ class PaidOperation:
 
 
 class PaymentFailure(Exception):
-    def __init__(self, code, message, status=402):
+    def __init__(self, code, message, status=402, *, challenge=True, details=None):
         self.code, self.message, self.status = code, message, status
+        self.challenge = challenge
+        self.details = details or {}
         super().__init__(code)
+
+
+@dataclass
+class PaymentReservation:
+    expires_at: int
+    outcome: PaymentFailure | None = None
+
+
+def uncertain_settlement(transaction=None):
+    details = {"network": NETWORK, "retry_new_payment": False,
+               "action": "reconcile_before_new_payment"}
+    if transaction is not None:
+        details["transaction"] = transaction
+    return PaymentFailure(
+        "payment_settlement_pending" if transaction else "payment_settlement_unknown",
+        "Settlement is not confirmed. Reconcile the authorization before making another payment.",
+        503, challenge=False, details=details)
 
 
 class Facilitator:
@@ -164,6 +183,8 @@ class Facilitator:
                 return _wire(result)
         except (httpx.HTTPError, ValueError, TypeError, KeyError, RecursionError):
             # Neither upstream response bodies nor signed authorizations are logged.
+            if operation == "settle":
+                raise uncertain_settlement() from None
             raise PaymentFailure("payment_service_unavailable", "Payment service is unavailable.", 503) from None
 
     async def verify(self, payload, requirements):
@@ -217,11 +238,14 @@ class PaymentGate:
         ))
 
     def error_response(self, request, operation, failure):
+        headers = {"Cache-Control": "no-store"}
+        if failure.challenge:
+            headers["PAYMENT-REQUIRED"] = encode_header(self.build_payment_required(request, operation))
         return JSONResponse(
-            {"success": False, "error": {"code": failure.code, "message": failure.message}},
+            {"success": False, "error": {"code": failure.code, "message": failure.message,
+                                          **failure.details}},
             status_code=failure.status,
-            headers={"PAYMENT-REQUIRED": encode_header(self.build_payment_required(request, operation)),
-                     "Cache-Control": "no-store"},
+            headers=headers,
         )
 
     def parse_payment(self, request, operation):
@@ -279,17 +303,27 @@ class PaymentGate:
         key = (auth["from"].lower(), auth["nonce"].lower())
         with self._lock:
             now = time.time()
-            self._seen = {k: expiry for k, expiry in self._seen.items() if expiry > now}
+            self._seen = {k: reservation for k, reservation in self._seen.items()
+                          if reservation.expires_at > now}
             if key in self._seen:
-                raise PaymentFailure("payment_replayed", "Payment authorization has already been submitted.")
+                if self._seen[key].outcome is not None:
+                    raise self._seen[key].outcome
+                raise PaymentFailure("payment_replayed",
+                    "Payment authorization has already been submitted. Reconcile before paying again.",
+                    409, challenge=False, details={"retry_new_payment": False})
             if len(self._seen) >= 10000:
                 raise PaymentFailure("payment_capacity_exceeded", "Payment service is temporarily busy.", 503)
-            self._seen[key] = int(auth["validBefore"]) + 5
+            self._seen[key] = PaymentReservation(int(auth["validBefore"]) + 5)
         return key
 
     def release(self, key):
         with self._lock:
             self._seen.pop(key, None)
+
+    def remember_outcome(self, key, failure):
+        with self._lock:
+            if key in self._seen:
+                self._seen[key].outcome = failure
 
     async def require_verified_payment(self, payload):
         data = await self.facilitator.verify(payload, self.requirements)
@@ -307,13 +341,21 @@ class PaymentGate:
         try:
             result = SettleResponse.model_validate(data, strict=True)
         except (ValueError, TypeError):
-            raise PaymentFailure("payment_service_unavailable", "Invalid settlement response.", 503) from None
+            raise uncertain_settlement() from None
+        if result.error_reason == "settlement_pending":
+            if (not result.success and result.network == NETWORK and HEX32.fullmatch(result.transaction)
+                    and (not result.payer or result.payer.lower() == payload.payload["authorization"]["from"].lower())
+                    and (result.amount is None or result.amount == self.amount)):
+                raise uncertain_settlement(result.transaction)
+            raise uncertain_settlement()
         if not result.success or result.error_reason:
+            if result.transaction or result.success or result.network != NETWORK:
+                raise uncertain_settlement()
             raise PaymentFailure("payment_settlement_failed", "Payment settlement could not be confirmed.")
         if (result.network != NETWORK or not HEX32.fullmatch(result.transaction)
                 or (result.payer and result.payer.lower() != payload.payload["authorization"]["from"].lower())
                 or (result.amount is not None and result.amount != self.amount)):
-            raise PaymentFailure("payment_settlement_failed", "Payment settlement could not be confirmed.")
+            raise uncertain_settlement()
         # Only the settlement receipt's public fields belong in the buyer response.
         receipt = {"success": True, "transaction": result.transaction, "network": result.network}
         if result.payer:
@@ -454,11 +496,16 @@ class PaymentMiddleware:
                 await send(message)
         except PaymentFailure as failure:
             state = failure.code
+            if key is not None and settling:
+                gate.remember_outcome(key, failure)
             await gate.error_response(request, op, failure)(scope, receive, send)
         except Exception:
-            state = "resource_unavailable"
-            await gate.error_response(request, op, PaymentFailure(
-                state, "Resource is temporarily unavailable.", 500))(scope, receive, send)
+            failure = uncertain_settlement() if settling else PaymentFailure(
+                "resource_unavailable", "Resource is temporarily unavailable.", 500)
+            state = failure.code
+            if key is not None and settling:
+                gate.remember_outcome(key, failure)
+            await gate.error_response(request, op, failure)(scope, receive, send)
         finally:
             if key is not None and not settling:
                 gate.release(key)
