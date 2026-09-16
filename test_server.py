@@ -37,6 +37,22 @@ def snapshot(pools):
 
 
 class TestPublicAndPayment(unittest.TestCase):
+    def test_self_test_reports_configuration_without_network_or_credentials(self):
+        client = TestClient(server.app)
+        facilitator = server.payment.facilitator
+        with patch.object(facilitator, "bearer_token", "diagnostic-fixture-secret"), \
+             patch.object(facilitator, "verify", new_callable=AsyncMock) as verify, \
+             patch.object(facilitator, "settle", new_callable=AsyncMock) as settle:
+            for url in ("", "https://diagnostic-facilitator.invalid"):
+                with self.subTest(configured=bool(url)), patch.object(facilitator, "url", url):
+                    response = client.get("/self-test")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["facilitator_configured"], bool(url))
+                    self.assertNotIn("diagnostic-facilitator", response.text)
+                    self.assertNotIn("diagnostic-fixture-secret", response.text)
+            verify.assert_not_awaited()
+            settle.assert_not_awaited()
+
     def setUp(self):
         self.client = TestClient(server.app)
 

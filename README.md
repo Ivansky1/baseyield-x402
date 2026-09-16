@@ -101,8 +101,29 @@ only (402); it never verifies, executes a paid operation, or settles.
 
 CI runs the entire pytest suite on Python 3.12, including
 `test_fake_header_does_not_unlock_resource`, on pushes and pull requests. This
-workflow must be enabled and configured as a required check in repository hosting
-to block merges; merely adding the workflow does not change branch protections.
+`payment-security` job is required on `main`, including administrator merges;
+the branch must be up to date. Force pushes and branch deletion are disabled.
+
+## Explicit PayAI configuration
+
+Use the secret-free `.env.example` values as process or deployment environment
+variables before startup; the application does **not** load that file automatically.
+`X402_FACILITATOR_URL=https://facilitator.payai.network` explicitly selects PayAI.
+The generic local default remains unset and fails closed. `/self-test` reports
+only whether a facilitator is configured; it does not contact or authenticate it.
+
+PayAI's ordinary exact free tier needs no merchant account, bearer token or CDP
+JWT. The current default allowance is **1,000 lifetime credits per receiving
+wallet**, shared across services using that wallet; shared-host/IP limits can
+reduce availability. Remaining allowance has not been checked. Pricing changes
+on 2026-09-21 at 12:00 UTC, so credits must not be equated to a fixed number of
+settlements. See [PayAI pricing](https://docs.payai.network/x402/facilitators/pricing).
+
+Exhaustion returns provider HTTP 403 (`free_tier_exhausted`); the application
+fails closed without releasing protected content. No account, paid credits or
+automatic top-up is configured. See the [developer reference](https://facilitator.payai.network/developers).
+Read-only supported-network metadata was checked; no real signed payment or
+on-chain settlement has been tested. Configuration is not proof of live readiness.
 
 ## Locked installation and settlement recovery
 
@@ -116,8 +137,8 @@ python -m pip install --require-hashes -r requirements.lock -r requirements-dev.
 python -m pytest -q
 ```
 
-CI uses the same hashed installation and the `payment-security` job. Requiring
-that job before merging is a separate repository branch-protection setting.
+CI uses the same hashed installation and the required `payment-security` job.
+GitHub branch protection was enabled and verified on 2026-09-16.
 
 If settlement returns `settlement_pending` with a validated transaction hash,
 the service returns HTTP 503 `payment_settlement_pending` with that hash. A
